@@ -988,6 +988,101 @@ void SQ4BitGemmM1Kernel_CompInt8_ScaleFp16_Impl(size_t          BlkLen,
     }
 }
 
+
+// ---- Q8_0 IME1 int8xint8 M4 kernel ----------------------------------------
+// Handles 4 rows at once using the 4-row interleaved A produced by quantize_a_4row_i8:
+// per K-block (stride 144B) the first 16B are the four fp32 row scales and the following
+// 128B are four 32B chunks, each holding 8 K-values for each of the 4 rows. That maps
+// directly onto vmadot's 4-lane row dimension, so the A side is identical to Q4_0.
+// B is block_q8_0x16 as in the M1 kernel: 32B of fp16 scales then 512B of interleaved
+// int8, loaded with 8 plain vle8 into v2..v9 (no nibble unpack).
+static void SQ8BitGemmM4Kernel_CompInt8_ScaleFp16_Impl(size_t          BlkLen,
+                                                       const uint8_t * QuantA,
+                                                       const uint8_t * QuantBData,
+                                                       float *         C,
+                                                       size_t          CountN,
+                                                       size_t          BlockCountK,
+                                                       const size_t    ldc) {
+    // Same invariant as the Q4_0 M4 kernel: SAVE_RESULT_4x16 stores a full 4x16 tile with no tail
+    // handling. Q8_0 and Q6_K are only admitted to the IME1 path when ne[1] % 16 == 0 (ime.cpp),
+    // and the n-tiling step is NB_COLS == 16, so a partial tile never reaches here.
+    GGML_ASSERT(CountN % 16 == 0);
+
+    const size_t INNER = BlkLen / 16;
+    const size_t LDC   = ldc * sizeof(float);
+
+    for (size_t n = 0; n < CountN; n += 16) {
+        uint8_t * QuantBDataPtr =
+            (uint8_t *) QuantBData + (n / 16) * BlockCountK * (16 * sizeof(_Float16) + 512);
+        float * CPtr = C + n;
+
+        __asm__ volatile(
+            "vsetvli            t0, zero, e32, m8           \n\t"
+            "vxor.vv            v24, v24, v24               \n\t"
+            "addi               t3, %[BlockCountK], 0       \n\t"
+            "addi               a1, %[A], 0                 \n\t"
+            "addi               s1, %[B], 0                 \n\t"
+
+            "BLOCK_COUNTK_LOOP%=:                           \n\t"
+            "addi               s5, s1, 0                   \n\t"
+            "addi               s1, s5, 32                  \n\t"
+            "vsetvli            t0, zero, e32, m8           \n\t"
+            "vxor.vv            v16, v16, v16               \n\t"
+            "flw                f1, (a1)                    \n\t"
+            "flw                f2, 4(a1)                   \n\t"
+            "flw                f3, 8(a1)                   \n\t"
+            "flw                f4, 12(a1)                  \n\t"
+            "addi               a1, a1, 16                  \n\t"
+            "addi               t2, %[INNER], 0             \n\t"
+
+            "BLOCK_INNER_LOOP%=:                            \n\t"
+            "vsetvli            t0, zero, e8, m1            \n\t"
+            "vle8.v             v2, (s1)                    \n\t"
+            "addi               s1, s1, 32                  \n\t"
+            "vle8.v             v3, (s1)                    \n\t"
+            "addi               s1, s1, 32                  \n\t"
+            "vle8.v             v4, (s1)                    \n\t"
+            "addi               s1, s1, 32                  \n\t"
+            "vle8.v             v5, (s1)                    \n\t"
+            "addi               s1, s1, 32                  \n\t"
+            "vle8.v             v6, (s1)                    \n\t"
+            "addi               s1, s1, 32                  \n\t"
+            "vle8.v             v7, (s1)                    \n\t"
+            "addi               s1, s1, 32                  \n\t"
+            "vle8.v             v8, (s1)                    \n\t"
+            "addi               s1, s1, 32                  \n\t"
+            "vle8.v             v9, (s1)                    \n\t"
+            "addi               s1, s1, 32                  \n\t"
+            "vle8.v             v10, (a1)                   \n\t"
+            "addi               a1, a1, 32                  \n\t"
+            "vle8.v             v11, (a1)                   \n\t"
+            "addi               a1, a1, 32                  \n\t"
+
+            SQ4BIT_KERNEL_COMP_4x16x16
+
+            "addi               t2, t2, -1                  \n\t"
+            "bnez               t2, BLOCK_INNER_LOOP%=      \n\t"
+
+            LOAD_SCALE_4x16_FP16
+
+            "vsetvli            t0, zero, e32, m8           \n\t"
+            "vfcvt.f.x.v        v16, v16                    \n\t"
+            "vfmacc.vv          v24, v16, v8                \n\t"
+            "addi               t3, t3, -1                  \n\t"
+            "bnez               t3, BLOCK_COUNTK_LOOP%=     \n\t"
+
+            "RESULT_SAVE%=:                                 \n\t"
+
+            SAVE_RESULT_4x16
+
+            :
+            : [INNER] "r"(INNER), [A] "r"(QuantA), [B] "r"(QuantBDataPtr), [LDC] "r"(LDC),
+              [BlockCountK] "r"(BlockCountK), [C] "r"(CPtr)
+            : "cc", "t0", "t1", "t2", "t3", "a1", "a2", "a3", "a4", "f1", "f2", "f3", "f4",
+              "s1", "s2", "s3", "s4", "s5", "s6");
+    }
+}
+
 // ---- Q8_0 IME1 int8xint8 M1 kernel ----------------------------------------
 // B comes from block_q8_0x16 (make_block_q8_0x16): 16 fp16 scales (32B) then 512B of interleaved
 // int8 weights laid out as [INNER0: reg0..reg7][INNER1: reg0..reg7], each reg 32B = 4 columns x
@@ -1153,7 +1248,11 @@ size_t gemm_kernel_i8i8(size_t          blk_len,
                         size_t          k_blks,
                         size_t          ldc) {
     GGML_UNUSED(quant_b_zp);
-    GGML_UNUSED(count_m);
+    if (count_m >= 4) {
+        SQ8BitGemmM4Kernel_CompInt8_ScaleFp16_Impl(blk_len, quant_a_ptr, quant_b_data, c_ptr, count_n, k_blks,
+                                                   ldc);
+        return 4;
+    }
     SQ8BitGemmM1Kernel_CompInt8_ScaleFp16_Impl(blk_len, quant_a_ptr, quant_b_data, c_ptr, count_n, k_blks, ldc);
     return 1;
 }

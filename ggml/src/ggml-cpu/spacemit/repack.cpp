@@ -1050,6 +1050,111 @@ static int repack_q4_k_to_q4_1_32_bl(ggml_tensor *              t,
     GGML_UNUSED(data_size);
 }
 
+
+// IME1 (16-column) variant of repack_q6_k_to_q8_0_32_bl_ref. Q6_K is dequantized and
+// requantized into Q8_0 blocks here, so the i8i8 kernel can consume it directly; the only
+// difference from the 32-column version is the interleave width and make_block_q8_0x16.
+static int repack_q6_k_to_q8_0_16_bl_ref(ggml_tensor *              t,
+                                         int                        interleave_block,
+                                         const void * GGML_RESTRICT data,
+                                         size_t                     data_size) {
+    GGML_ASSERT(t->type == GGML_TYPE_Q6_K);
+    GGML_ASSERT(interleave_block == 16);
+    GGML_ASSERT(QK_K / QK4_1 == 8);
+
+    constexpr int nrows_interleaved = 16;
+
+    block_q8_0x16 *    dst = (block_q8_0x16 *) t->data;
+    const block_q6_K * src = (const block_q6_K *) data;
+    block_q8_0         dst_tmp[16];
+    int8_t             aux8[QK4_1];
+    int                nrow    = ggml_nrows(t);
+    int                nblocks = t->ne[0] / QK_K;
+
+    if (t->ne[0] % QK_K != 0) {
+        return -1;
+    }
+
+    for (int b = 0; b < nrow; b += nrows_interleaved) {
+        int64_t nrow_real = std::min((int64_t) nrow - b, (int64_t) nrows_interleaved);
+        for (int64_t x = 0; x < nblocks; x++) {
+            for (int bi = 0; bi < 8; bi++) {
+                int i = 0;
+                for (; i < nrow_real; i++) {
+                    const uint8_t * q4     = src[x + i * nblocks].ql;
+                    const uint8_t * qh     = src[x + i * nblocks].qh;
+                    const int8_t *  scales = src[x + i * nblocks].scales;
+                    float           d      = GGML_FP16_TO_FP32(src[x + i * nblocks].d);
+
+                    q4 += 64 * (bi / 4);
+                    qh += 32 * (bi / 4);
+                    int8_t * GGML_RESTRICT a = aux8;
+
+                    int8_t bi_idx = bi % 4;
+
+                    if (bi_idx == 0) {
+                        for (int l = 0; l < 32; ++l) {
+                            a[l] = (int8_t) ((q4[l] & 0xF) | (((qh[l] >> 0) & 3) << 4)) - 32;
+                        }
+                    } else if (bi_idx == 1) {
+                        for (int l = 0; l < 32; ++l) {
+                            a[l] = (int8_t) ((q4[l + 32] & 0xF) | (((qh[l] >> 2) & 3) << 4)) - 32;
+                        }
+                    } else if (bi_idx == 2) {
+                        for (int l = 0; l < 32; ++l) {
+                            a[l] = (int8_t) ((q4[l + 0] >> 4) | (((qh[l] >> 4) & 3) << 4)) - 32;
+                        }
+                    } else if (bi_idx == 3) {
+                        for (int l = 0; l < 32; ++l) {
+                            a[l] = (int8_t) ((q4[l + 32] >> 4) | (((qh[l] >> 6) & 3) << 4)) - 32;
+                        }
+                    }
+                    a = aux8;
+
+                    float a_max_abs = 0.0f;
+                    float scale_0   = scales[bi * 2 + 0] * d;
+                    float scale_1   = scales[bi * 2 + 1] * d;
+                    for (int l = 0; l < 16; ++l) {
+                        a_max_abs = std::max(a_max_abs, std::abs(a[l] * scale_0));
+                    }
+
+                    for (int l = 16; l < 32; ++l) {
+                        a_max_abs = std::max(a_max_abs, std::abs(a[l] * scale_1));
+                    }
+
+                    float reflect_scale   = a_max_abs / ((1 << 7) - 1);
+                    float reflect_scale_0 = scale_0 / reflect_scale;
+                    float reflect_scale_1 = scale_1 / reflect_scale;
+
+                    for (int l = 0; l < 16; ++l) {
+                        float a_temp = std::clamp(std::nearbyintf(a[l] * reflect_scale_0), -128.0f, 127.0f);
+                        a[l]         = (int8_t) (a_temp);
+                    }
+
+                    for (int l = 16; l < 32; ++l) {
+                        float a_temp = std::clamp(std::nearbyintf(a[l] * reflect_scale_1), -128.0f, 127.0f);
+                        a[l]         = (int8_t) (a_temp);
+                    }
+
+                    dst_tmp[i].d = GGML_FP32_TO_FP16(reflect_scale);
+
+                    memcpy(dst_tmp[i].qs, a, 32 * sizeof(int8_t));
+                }
+
+                for (; i < nrows_interleaved; i++) {
+                    memset(&dst_tmp[i], 0, sizeof(block_q8_0));
+                }
+
+                *dst++ = make_block_q8_0x16(dst_tmp, interleave_block);
+            }
+        }
+        src += nrows_interleaved * nblocks;
+    }
+    return 0;
+
+    GGML_UNUSED(data_size);
+}
+
 static int repack_q6_k_to_q8_0_32_bl_ref(ggml_tensor *              t,
                                          int                        interleave_block,
                                          const void * GGML_RESTRICT data,
@@ -1826,6 +1931,10 @@ template <> int repack<block_q4_1, 256, 32>(ggml_tensor * t, const void * data, 
 
 template <> int repack<block_q4_K, 32, 32>(ggml_tensor * t, const void * data, size_t data_size) {
     return repack_q4_k_to_q4_1_32_bl(t, 32, data, data_size);
+}
+
+template <> int repack<block_q6_K, 32, 16>(ggml_tensor * t, const void * data, size_t data_size) {
+    return repack_q6_k_to_q8_0_16_bl_ref(t, 16, data, data_size);
 }
 
 template <> int repack<block_q6_K, 32, 32>(ggml_tensor * t, const void * data, size_t data_size) {
