@@ -591,22 +591,23 @@ void SQ4BitGemmM4Kernel_CompInt8_ScaleFp16_Impl(size_t          BlkLen,
                                                 size_t          CountN,
                                                 size_t          BlockCountK,
                                                 const size_t    ldc) {
-    size_t       LDC   = ldc * sizeof(float);
+    // The M4 kernel stores a full 4x16 tile unconditionally (see SAVE_RESULT_4x16), so it has no
+    // tail handling for a partial n-tile. Callers guarantee this: a tensor is only admitted to the
+    // IME1 path when ne[1] % 16 == 0 (ime.cpp), repack rejects anything else (repack.cpp), and the
+    // n-tiling step is a multiple of NB_COLS == 16. Assert the invariant rather than silently
+    // discarding results if that ever changes.
+    GGML_ASSERT(CountN % 16 == 0);
+
+    const size_t LDC   = ldc * sizeof(float);
     const size_t INNER = BlkLen / 16;
-    float        tmp[4 * 16];
 
     if constexpr (HasZeroPoint) {
         for (size_t n = 0; n < CountN; n += 16) {
-            size_t    NBLKS         = (CountN - n) > 16 ? 16 : CountN - n;
             uint8_t * QuantBDataPtr = (uint8_t *) QuantBData +             //
                                       n * BlockCountK * BlkLen / 2 +       // b data
                                       n * BlockCountK * sizeof(uint8_t) +  // zp
                                       n * BlockCountK * sizeof(_Float16);  // scale
             float * CPtr = C + n;
-            if (NBLKS < 16) {
-                CPtr = tmp;
-                LDC  = 16 * sizeof(float);
-            }
 
             __asm__ volatile(
                 "vsetvli            t0, zero, e32, m8           \n\t"
@@ -687,15 +688,10 @@ void SQ4BitGemmM4Kernel_CompInt8_ScaleFp16_Impl(size_t          BlkLen,
         }
     } else {
         for (size_t n = 0; n < CountN; n += 16) {
-            size_t    NBLKS         = (CountN - n) > 16 ? 16 : CountN - n;
             uint8_t * QuantBDataPtr = (uint8_t *) QuantBData +             //
                                       n * BlockCountK * BlkLen / 2 +       // b data
                                       n * BlockCountK * sizeof(_Float16);  // scale
             float * CPtr = C + n;
-            if (NBLKS < 16) {
-                CPtr = tmp;
-                LDC  = 16 * sizeof(float);
-            }
 
             __asm__ volatile(
                 "vsetvli            t0, zero, e32, m8           \n\t"
