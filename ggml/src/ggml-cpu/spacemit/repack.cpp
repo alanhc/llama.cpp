@@ -438,6 +438,54 @@ static int repack_q8_0_to_q8_0_16_bl_ref(ggml_tensor *              t,
     GGML_UNUSED(data_size);
 }
 
+// IME1 (16-column) repack of Q5_0 into Q8_0 blocks. Q5_0 dequantizes to signed 5-bit values
+// (-16..15) with a single scale per 32-value block, so this is a lossless re-encoding into
+// int8 (no requantization): unpack the 5 bits, subtract 16, store as int8, carry d unchanged.
+// The i8i8 kernel then consumes it exactly like Q8_0.
+static int repack_q5_0_to_q8_0_16_bl_ref(ggml_tensor *              t,
+                                         int                        interleave_block,
+                                         const void * GGML_RESTRICT data,
+                                         size_t                     data_size) {
+    GGML_ASSERT(t->type == GGML_TYPE_Q5_0);
+    GGML_ASSERT(interleave_block == 16);
+
+    constexpr int nrows_interleaved = 16;
+
+    block_q8_0x16 *    dst = (block_q8_0x16 *) t->data;
+    const block_q5_0 * src = (const block_q5_0 *) data;
+    block_q8_0         dst_tmp[16];
+    int                nrow    = ggml_nrows(t);
+    int                nblocks = t->ne[0] / QK5_0;
+
+    GGML_ASSERT(data_size == nrow * nblocks * sizeof(block_q5_0));
+
+    if (t->ne[1] % nrows_interleaved != 0 || t->ne[0] % QK5_0 != 0) {
+        return -1;
+    }
+
+    for (int b = 0; b < nrow; b += nrows_interleaved) {
+        for (int64_t x = 0; x < nblocks; x++) {
+            for (int i = 0; i < nrows_interleaved; i++) {
+                const block_q5_0 * sb = &src[x + i * nblocks];
+                dst_tmp[i].d = sb->d;
+                uint32_t qh;
+                memcpy(&qh, sb->qh, sizeof(qh));
+                for (int j = 0; j < QK5_0 / 2; ++j) {
+                    const uint8_t xh_0 = ((qh >> (j + 0)) << 4) & 0x10;
+                    const uint8_t xh_1 = ((qh >> (j + 12))     ) & 0x10;
+                    dst_tmp[i].qs[j]            = (int8_t) (((sb->qs[j] & 0x0F) | xh_0) - 16);
+                    dst_tmp[i].qs[j + QK5_0/2] = (int8_t) (((sb->qs[j] >>   4) | xh_1) - 16);
+                }
+            }
+            *dst++ = make_block_q8_0x16(dst_tmp, interleave_block);
+        }
+        src += nrows_interleaved * nblocks;
+    }
+    return 0;
+
+    GGML_UNUSED(data_size);
+}
+
 static int repack_q2_k_to_q2_k_32_bl(ggml_tensor *              t,
                                      int                        interleave_block,
                                      const void * GGML_RESTRICT data,
@@ -1959,6 +2007,10 @@ template <> int repack<block_q8_0, 32, 32>(ggml_tensor * t, const void * data, s
 
 template <> int repack<block_mxfp4, 32, 32>(ggml_tensor * t, const void * data, size_t data_size) {
     return repack_mxfp4_to_mxfp4_32_bl(t, 32, data, data_size);
+}
+
+template <> int repack<block_q5_0, 32, 16>(ggml_tensor * t, const void * data, size_t data_size) {
+    return repack_q5_0_to_q8_0_16_bl_ref(t, 16, data, data_size);
 }
 
 template <> int repack<block_q5_0, 32, 32>(ggml_tensor * t, const void * data, size_t data_size) {

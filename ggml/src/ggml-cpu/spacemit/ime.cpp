@@ -97,7 +97,11 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS> constexpr siz
     } else if constexpr (std::is_same_v<BLOC_TYPE, block_q5_1> || std::is_same_v<BLOC_TYPE, block_q5_K>) {
         return sizeof(spacemit_kernels::nrow_block_q5_1<1>);
     } else if constexpr (std::is_same_v<BLOC_TYPE, block_q5_0>) {
-        return sizeof(spacemit_kernels::nrow_block_q5_0<1>);
+        if constexpr (NB_COLS == 16) {
+            return sizeof(block_q8_0);  // IME1: Q5_0 repacked losslessly into Q8_0 blocks
+        } else {
+            return sizeof(spacemit_kernels::nrow_block_q5_0<1>);  // IME2: narrow i8i5 format
+        }
     } else {
         assert(false);
         return 0;
@@ -322,7 +326,8 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS> class tensor_
                 gemm_kernel     = spacemit_kernels::ime1::gemm_kernel_i8i4;
                 set_kernel_impl = true;
             } else if constexpr (std::is_same_v<BLOC_TYPE, block_q8_0> ||
-                                 std::is_same_v<BLOC_TYPE, block_q6_K>) {
+                                 std::is_same_v<BLOC_TYPE, block_q6_K> ||
+                                 std::is_same_v<BLOC_TYPE, block_q5_0>) {
                 gemm_kernel     = spacemit_kernels::ime1::gemm_kernel_i8i8;
                 set_kernel_impl = true;
             }
@@ -629,7 +634,8 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS> class tensor_
                 gemm_kernel     = spacemit_kernels::ime1::gemm_kernel_i8i4;
                 set_kernel_impl = true;
             } else if constexpr (std::is_same_v<BLOC_TYPE, block_q8_0> ||
-                                 std::is_same_v<BLOC_TYPE, block_q6_K>) {
+                                 std::is_same_v<BLOC_TYPE, block_q6_K> ||
+                                 std::is_same_v<BLOC_TYPE, block_q5_0>) {
                 gemm_kernel        = spacemit_kernels::ime1::gemm_kernel_i8i8;
                 set_kernel_impl    = true;
             }
@@ -1261,6 +1267,7 @@ static const tensor_traits<block_mxfp4, 32, 32> mxfp4_32x32_q8_0;
 static const tensor_traits<block_q5_K, 32, 32>  q5_k_32x32_q8_0;
 static const tensor_traits<block_q5_1, 32, 32>  q5_1_32x32_q8_0;
 static const tensor_traits<block_q5_0, 32, 32>  q5_0_32x32_q8_0;
+static const tensor_traits<block_q5_0, 32, 16>  q5_0_16x32_q8_0;
 // Impl By RVV
 static const tensor_traits_common               rvv_impl;
 
@@ -1405,6 +1412,12 @@ static const ggml::cpu::tensor_traits * ggml_riscv64_spacemit_get_optimal_repack
 #if defined(RISCV64_SPACEMIT_IME2)
                 if (cur->ne[1] % 32 == 0 && (ggml::cpu::riscv64_spacemit::global_spine_env_info.use_ime2)) {
                     return &ggml::cpu::riscv64_spacemit::q5_0_32x32_q8_0;
+                }
+#endif
+
+#if defined(RISCV64_SPACEMIT_IME1)
+                if (cur->ne[1] % 16 == 0 && (ggml::cpu::riscv64_spacemit::global_spine_env_info.use_ime1)) {
+                    return &ggml::cpu::riscv64_spacemit::q5_0_16x32_q8_0;
                 }
 #endif
             }
@@ -1588,7 +1601,31 @@ static size_t ggml_backend_cpu_riscv64_spacemit_nbytes(ggml_backend_buffer_type_
             nbytes = remap_block_nbytes(sizeof(block_q5_1), sizeof(spacemit_kernels::nrow_block_q5_1<1>));
             break;
         case GGML_TYPE_Q5_0:
-            nbytes = remap_block_nbytes(sizeof(block_q5_0), sizeof(spacemit_kernels::nrow_block_q5_0<1>));
+            {
+                // The repacked block type depends on which engine actually claims this tensor, so
+                // mirror the selection in ggml_riscv64_spacemit_get_optimal_repack_type exactly:
+                // IME2 is tried first (32-column, narrow nrow_block_q5_0), then IME1 (16-column,
+                // lossless re-encode into Q8_0 blocks). Both engines can be compiled in at once,
+                // so this has to be a run-time check, not #if defined.
+                bool ime1_q5_0 = false;
+#if defined(RISCV64_SPACEMIT_IME2)
+                if (tensor->ne[1] % 32 == 0 && ggml::cpu::riscv64_spacemit::global_spine_env_info.use_ime2) {
+                    ime1_q5_0 = false;
+                } else
+#endif
+                {
+#if defined(RISCV64_SPACEMIT_IME1)
+                    ime1_q5_0 = tensor->ne[1] % 16 == 0 &&
+                                ggml::cpu::riscv64_spacemit::global_spine_env_info.use_ime1;
+#endif
+                }
+
+                if (ime1_q5_0) {
+                    nbytes = remap_block_nbytes(sizeof(block_q5_0), sizeof(block_q8_0), 32);
+                } else {
+                    nbytes = remap_block_nbytes(sizeof(block_q5_0), sizeof(spacemit_kernels::nrow_block_q5_0<1>));
+                }
+            }
             break;
         default:
             nbytes = add_strided_nbytes(row_nbytes, 1, 1);
