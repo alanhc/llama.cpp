@@ -345,7 +345,9 @@ static inline int32x4_t ggml_nvfp4_dot8(const int8x8_t q4_lo, const int8x8_t q8_
 #include <immintrin.h>
 #endif
 
-#ifdef __riscv_v_intrinsic
+// Check __riscv_vector rather than __riscv_v_intrinsic for RVV code: clang
+// defines __riscv_v_intrinsic for every RISC-V target, even without V.
+#ifdef __riscv_vector
 #include <riscv_vector.h>
 #endif
 

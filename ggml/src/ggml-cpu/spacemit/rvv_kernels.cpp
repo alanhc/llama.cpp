@@ -10,7 +10,7 @@
 #include <cstdint>
 #include <stdexcept>
 
-#if !defined(__riscv_v) || !defined(__riscv_v_intrinsic)
+#if !defined(__riscv_v) || !defined(__riscv_vector)
 #    error "riscv v extension or v_intrinsic not enabled"
 #else
 #    include <riscv_vector.h>
